@@ -9,6 +9,9 @@ os.environ.setdefault("FASTMCP_HOST", "0.0.0.0")
 
 # ==================== 1. 全局配置 ====================
 AUTO_MODE = False
+_AUTO_GENERATION = 0
+# 手动命令、停止和自动步骤使用同一把锁，防止停止后被旧步骤重新启动。
+_CONTROL_CONDITION = threading.Condition(threading.RLock())
 DEVICE_ID = os.getenv("DEVICE_ID", "13")
 GROUP = os.getenv("GROUP", "6f4f01112918afe457d9d9e9c1c7a331")
 SHARE_ID = os.getenv("SHARE_ID", "834697")  # 初始 ID，之后可用 update_share_id 热更新
@@ -20,7 +23,6 @@ class KisstoyRemote:
         self.share_id = str(share_id)
         self.ws = None
         self.is_connected = False
-        self.connect()
 
     def bind(self):
         try:
@@ -46,14 +48,18 @@ class KisstoyRemote:
         threading.Thread(target=run, daemon=True).start()
 
     def control(self, motor, intensity):
+        return self.control_motors({str(motor): int(intensity)})
+
+    def control_motors(self, motors):
+        """同一条消息可更新多个通道，全部停止必须同时包含两路归零。"""
         if not self.is_connected:
-            print(f"DEBUG: 尝试发送指令到通道[{motor}]，但 WS 处于离线状态")
+            print("DEBUG: 尝试发送指令，但 WS 处于离线状态")
             return False
         cmd = {"event": "control", "data": {"target": self.group, "device_id": self.device_id,
-               "motors": {str(motor): int(intensity)}}}
+               "motors": {str(motor): int(value) for motor, value in motors.items()}}}
         try:
             self.ws.send(json.dumps(cmd))
-            print(f"DEBUG: 成功发送 -> 通道[{motor}] 强度[{intensity}%]")
+            print(f"DEBUG: 成功发送 -> {cmd['data']['motors']}")
             return True
         except Exception as e:
             print(f"DEBUG: 指令发送异常 -> {e}")
@@ -64,37 +70,59 @@ remote = KisstoyRemote(DEVICE_ID, GROUP, SHARE_ID)
 # ==================== 2. MCP 服务端 ====================
 mcp = FastMCP("Kisstoy-Controller")
 
+def _set_auto_mode(enable):
+    """调用者持有 _CONTROL_CONDITION；代数使快速关开后的旧步骤失效。"""
+    global AUTO_MODE, _AUTO_GENERATION
+    AUTO_MODE = enable
+    _AUTO_GENERATION += 1
+    _CONTROL_CONDITION.notify_all()
+
+
+def _stop_all():
+    with _CONTROL_CONDITION:
+        _set_auto_mode(False)
+        if remote.control_motors({"1": 0, "3": 0}):
+            return "自动挂机已关闭，已发送振动和吮吸两路停止指令；设备是否停下需实际确认。"
+        return "停止指令发送失败：自动挂机已关闭，但无法确认设备已停止，请检查连接或使用设备上的停止键。"
+
+
 @mcp.tool()
 def control_device(motor: int, intensity: int) -> str:
     """
     控制物理设备。motor=1 代表振动，motor=3 代表吮吸。
-    intensity 范围为 0-100。传 0 表示紧急停止并关闭所有通道。
+    intensity 范围为 0-100。传 0 仅关闭指定通道，不改变另一通道。
+    手动控制会取消自动挂机。全部停止请调用 stop_all 或 set_auto_pilot(false)。
     """
-    global AUTO_MODE
-    if intensity == 0:
-        AUTO_MODE = False
-        remote.control("1", 0)
-        remote.control("3", 0)
-        return "已触发急停，全部通道已关闭。"
-    AUTO_MODE = False
-    remote.control(str(motor), intensity)
-    return f"通道 {motor} 已调整为 {intensity}% 强度。"
+    if motor not in (1, 3):
+        return "参数错误：motor 只能为 1（振动）或 3（吮吸）。"
+    if not 0 <= intensity <= 100:
+        return "参数错误：intensity 必须在 0-100 之间。"
+    with _CONTROL_CONDITION:
+        _set_auto_mode(False)
+        if not remote.control(str(motor), intensity):
+            return f"通道 {motor} 指令发送失败：自动挂机已关闭，请检查设备连接；无法确认设备状态。"
+    return f"已发送通道 {motor} 的 {intensity}% 强度指令。"
+
+
+@mcp.tool()
+def stop_all() -> str:
+    """全部停止/急停：取消自动挂机，并在同一条消息中将振动和吮吸都设为 0。"""
+    return _stop_all()
 
 @mcp.tool()
 def set_auto_pilot(enable: bool) -> str:
     """
     开启或关闭自动挂机模式（交替振动和吮吸）。
-    enable=true 开启，enable=false 彻底关闭并关机。
+    enable=true 开启，enable=false 取消自动挂机并发送两路停止指令。
     """
-    global AUTO_MODE
-    if enable:
-        AUTO_MODE = True
+    if not enable:
+        return _stop_all()
+    with _CONTROL_CONDITION:
+        if not remote.is_connected:
+            _set_auto_mode(False)
+            return "自动挂机未开启：设备通道离线，请先检查连接。"
+        _set_auto_mode(True)
         return "自动挂机已开启，正在按节奏运行。"
-    else:
-        AUTO_MODE = False
-        remote.control("1", 0)
-        remote.control("3", 0)
-        return "自动挂机已关闭，设备已停息。"
 
 @mcp.tool()
 def update_share_id(new_id: str) -> str:
@@ -113,42 +141,42 @@ def update_share_id(new_id: str) -> str:
         return f"更新失败: {e}"
 
 # ==================== 3. 自动驾驶线程 ====================
+AUTO_STEPS = (
+    ({"1": 40, "3": 0}, 3.0),
+    ({"1": 0, "3": 60}, 2.0),
+    ({"1": 50, "3": 50}, 1.0),
+    ({"1": 0, "3": 0}, 1.0),
+)
+
+
+def _run_auto_step(generation, motors, duration):
+    with _CONTROL_CONDITION:
+        if not AUTO_MODE or generation != _AUTO_GENERATION:
+            return False
+        if not remote.control_motors(motors):
+            _set_auto_mode(False)
+            print("!!! 自动挂机指令发送失败，已取消自动挂机；设备状态需实际确认 !!!")
+            return False
+        cancelled = _CONTROL_CONDITION.wait_for(
+            lambda: not AUTO_MODE or generation != _AUTO_GENERATION,
+            timeout=duration,
+        )
+        return not cancelled
+
+
 def ai_auto_pilot():
     while True:
-        if AUTO_MODE:
-            remote.control("1", 40)
-            remote.control("3", 0)
-            for _ in range(30):
-                if not AUTO_MODE: break
-                time.sleep(0.1)
-            if not AUTO_MODE: continue
-
-            remote.control("1", 0)
-            remote.control("3", 60)
-            for _ in range(20):
-                if not AUTO_MODE: break
-                time.sleep(0.1)
-            if not AUTO_MODE: continue
-
-            remote.control("1", 50)
-            remote.control("3", 50)
-            for _ in range(10):
-                if not AUTO_MODE: break
-                time.sleep(0.1)
-            if not AUTO_MODE: continue
-
-            remote.control("1", 0)
-            remote.control("3", 0)
-            for _ in range(10):
-                if not AUTO_MODE: break
-                time.sleep(0.1)
-        else:
-            time.sleep(0.5)
-
-threading.Thread(target=ai_auto_pilot, daemon=True).start()
+        with _CONTROL_CONDITION:
+            _CONTROL_CONDITION.wait_for(lambda: AUTO_MODE)
+            generation = _AUTO_GENERATION
+        for motors, duration in AUTO_STEPS:
+            if not _run_auto_step(generation, motors, duration):
+                break
 
 # ==================== 4. 启动服务（关键修正） ====================
 if __name__ == '__main__':
+    remote.connect()
+    threading.Thread(target=ai_auto_pilot, daemon=True).start()
     print(">>> 启动 MCP 服务 (streamable-http 模式)")
     print(f">>> 监听端口由环境变量 FASTMCP_PORT 决定: {os.environ.get('FASTMCP_PORT')}")
     # 只传 transport，绝不再传 host/port，避免 TypeError
