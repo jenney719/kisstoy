@@ -22,6 +22,50 @@ class KisstoyRemote:
         self.share_id = str(share_id)
         self.ws = None
         self.is_connected = False
+        self._connection_lock = threading.RLock()
+        self._connect_thread = None
+        self.last_error = "WebSocket 尚未连接。"
+        self.last_sent_motors = None
+
+    def is_ready(self):
+        with self._connection_lock:
+            sock = self.ws.sock if self.ws is not None else None
+            return bool(self.is_connected and sock is not None and sock.connected)
+
+    def _on_open(self, ws):
+        with self._connection_lock:
+            if ws is not self.ws:
+                return
+            sock = ws.sock
+            self.is_connected = bool(sock is not None and sock.connected)
+            self.last_error = "" if self.is_connected else "WebSocket 握手尚未完成。"
+        if self.is_connected:
+            print("!!! 云端 WebSocket 握手完成；设备执行状态仍需实际确认 !!!")
+
+    def _on_error(self, ws, error):
+        with self._connection_lock:
+            if ws is not self.ws:
+                return
+            self.is_connected = False
+            self.last_error = f"WebSocket 异常：{type(error).__name__}。"
+        print(f"!!! WS 错误: {error} !!!")
+
+    def _on_close(self, ws, *args):
+        with self._connection_lock:
+            if ws is not self.ws:
+                return
+            self.is_connected = False
+            if not self.last_error:
+                self.last_error = "WebSocket 已断开，正在等待重连。"
+
+    def connection_status(self):
+        with self._connection_lock:
+            return {
+                "websocket_ready": self.is_ready(),
+                "last_error": self.last_error,
+                "last_sent_motors": self.last_sent_motors,
+                "device_execution_confirmed": False,
+            }
 
     def bind(self):
         try:
@@ -37,30 +81,51 @@ class KisstoyRemote:
             while True:
                 print(">>> 正在尝试建立云端 WebSocket 通道...")
                 self.bind()
-                self.ws = websocket.WebSocketApp(url,
-                    on_open=lambda ws: (print("!!! WS 连通成功，设备已就绪 !!!"), setattr(self, 'is_connected', True)),
-                    on_error=lambda ws, e: print(f"!!! WS 错误: {e} !!!"),
-                    on_close=lambda ws, *args: (print("!!! WS 断开，5秒后重连 !!!"), setattr(self, 'is_connected', False)))
-                self.ws.run_forever(ping_interval=10, ping_timeout=5)
+                ws = websocket.WebSocketApp(url,
+                    on_open=self._on_open, on_error=self._on_error,
+                    on_close=self._on_close)
+                with self._connection_lock:
+                    self.is_connected = False
+                    self.last_error = "正在等待 WebSocket 握手，请稍后重试。"
+                    self.ws = ws
+                try:
+                    ws.run_forever(ping_interval=10, ping_timeout=5)
+                except Exception as error:
+                    self._on_error(ws, error)
+                finally:
+                    self._on_close(ws)
                 time.sleep(5)
-        threading.Thread(target=run, daemon=True).start()
+        with self._connection_lock:
+            if self._connect_thread is not None and self._connect_thread.is_alive():
+                return
+            self._connect_thread = threading.Thread(target=run, daemon=True)
+            self._connect_thread.start()
 
     def control(self, motor, intensity):
         return self.control_motors({str(motor): int(intensity)})
 
     def control_motors(self, motors):
-        if not self.is_connected:
-            print("DEBUG: 尝试发送指令，但 WS 处于离线状态")
-            return False
         cmd = {"event": "control", "data": {"target": self.group, "device_id": self.device_id,
                "motors": {str(motor): int(value) for motor, value in motors.items()}}}
-        try:
-            self.ws.send(json.dumps(cmd))
-            print(f"DEBUG: 成功发送 -> {cmd['data']['motors']}")
-            return True
-        except Exception as e:
-            print(f"DEBUG: 指令发送异常 -> {e}")
-            return False
+        with self._connection_lock:
+            if not self.is_ready():
+                self.is_connected = False
+                if not self.last_error:
+                    self.last_error = "WebSocket 套接字已断开，请等待重连。"
+                print(f"DEBUG: 指令未发送 -> {self.last_error}")
+                return False
+            ws = self.ws
+            try:
+                ws.send(json.dumps(cmd))
+                self.last_sent_motors = cmd['data']['motors'].copy()
+                self.last_error = ""
+                print(f"DEBUG: 成功发送 -> {cmd['data']['motors']}")
+                return True
+            except Exception as error:
+                self.is_connected = False
+                self.last_error = f"WebSocket 发送异常：{type(error).__name__}。"
+                print(f"DEBUG: 指令发送异常 -> {error}")
+                return False
 
 remote = KisstoyRemote(DEVICE_ID, GROUP, SHARE_ID)
 
@@ -176,7 +241,9 @@ PATTERNS = {
 }
 
 # ==================== 3. MCP 服务端 ====================
-mcp = FastMCP("Kisstoy-Controller")
+# 工具不依赖 MCP 会话状态；设备/模式状态仍由本进程管理。
+# 避免 Railway 重部署后，Aru 携带旧会话 ID 导致工具请求被拒绝。
+mcp = FastMCP("Kisstoy-Controller", stateless_http=True, json_response=True)
 
 def _set_auto_mode(enable, pattern=None):
     global AUTO_MODE, _AUTO_GENERATION, _CURRENT_PATTERN
@@ -191,8 +258,8 @@ def _stop_all():
     with _CONTROL_CONDITION:
         _set_auto_mode(False)
         if remote.control_motors({"1": 0, "3": 0}):
-            return "已停止所有通道，自动模式已关闭。"
-        return "停止指令发送失败，请检查连接或手动关闭设备。"
+            return "已发送两路停止指令，自动模式已关闭；设备是否停止需实际确认。"
+        return f"停止指令发送失败：{remote.last_error}自动模式已关闭，请检查连接或手动关闭设备。"
 
 
 @mcp.tool()
@@ -209,11 +276,17 @@ def control_device(motor: int, intensity: int) -> str:
     with _CONTROL_CONDITION:
         _set_auto_mode(False)
         if not remote.control(str(motor), intensity):
-            return f"通道 {motor} 指令发送失败，请检查连接。"
-    channel = "振动" if motor == 1 else "吮吸"
-    if intensity == 0:
-        return f"通道 {motor} 已调整为 {intensity}% 强度。"
-    return f"通道 {motor} 已调整为 {intensity}% 强度。"
+            return f"通道 {motor} 指令发送失败：{remote.last_error}自动模式已关闭。"
+    return f"已发送通道 {motor} 的 {intensity}% 强度指令；设备是否执行需实际确认。"
+
+
+@mcp.tool()
+def get_status() -> str:
+    """只读检查云端连接、自动模式和最近发送指令；不连接、不启动或操作设备。"""
+    with _CONTROL_CONDITION:
+        status = remote.connection_status()
+        status.update(auto_mode=AUTO_MODE, pattern=_CURRENT_PATTERN)
+    return json.dumps(status, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -245,12 +318,12 @@ def start_pattern(pattern: str) -> str:
         available = ", ".join(PATTERNS.keys())
         return f"未知模式 '{pattern}'，可用模式：{available}"
     with _CONTROL_CONDITION:
-        if not remote.is_connected:
+        if not remote.is_ready():
             _set_auto_mode(False)
-            return "设备离线，无法启动模式，请检查连接。"
+            return f"模式未开启：{remote.last_error}请用 get_status 检查连接。"
         _set_auto_mode(True, pattern)
         p = PATTERNS[pattern]
-        return f"已启动模式【{p['name']}】：{p['desc']}"
+        return f"已开启后台模式【{p['name']}】，设备是否执行需实际确认。"
 
 
 @mcp.tool()
@@ -263,9 +336,9 @@ def set_auto_pilot(enable: bool) -> str:
     if not enable:
         return _stop_all()
     with _CONTROL_CONDITION:
-        if not remote.is_connected:
+        if not remote.is_ready():
             _set_auto_mode(False)
-            return "设备离线，无法启动自动模式。"
+            return f"自动模式未开启：{remote.last_error}请用 get_status 检查连接。"
         _set_auto_mode(True)
         p = PATTERNS[_CURRENT_PATTERN]
         return f"自动模式已开启，当前模式：【{p['name']}】"
@@ -295,7 +368,7 @@ def _run_auto_step(generation, motors, duration):
             return False
         if not remote.control_motors(motors):
             _set_auto_mode(False)
-            print("!!! 自动模式指令发送失败，已停止 !!!")
+            print("!!! 自动模式指令发送失败，已取消自动模式；设备状态需实际确认 !!!")
             return False
         cancelled = _CONTROL_CONDITION.wait_for(
             lambda: not AUTO_MODE or generation != _AUTO_GENERATION,

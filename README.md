@@ -29,6 +29,12 @@ python main.py
 
 部署保留原来的 `Procfile` 和 streamable HTTP MCP 服务。通过环境变量设置 `DEVICE_ID`、`GROUP`、`SHARE_ID`，以及 `PORT`（默认 8000）或 `FASTMCP_PORT`。`update_share_id(new_id)` 可以热更新分享 ID。
 
+HTTP 使用无会话模式和 JSON 响应，避免 Railway 重部署后客户端沿用旧 MCP 会话 ID 而被拒绝。自动模式和设备连接仍由本进程维护，更新后需在 Aru 中重新连接或刷新工具列表。
+
+连接就绪同时检查当前 WebSocket 的握手标记和实际套接字状态。握手未完成时不会启动模式或发送指令；异常、断线和重连会清理旧状态，旧连接的回调不会影响新连接。后台自动线程在启动时等待模式开启，不会抢先发送指令。
+
+`get_status()` 是只读诊断工具，返回 `websocket_ready`、`last_error`、`auto_mode`、`pattern`、`last_sent_motors` 和 `device_execution_confirmed`。最近发送指令记录不等于设备执行反馈；当前协议未验证设备执行，因此 `device_execution_confirmed` 为 false。控制失败时返回握手、离线或发送异常的具体原因。
+
 仅执行 `python main.py` 才会启动设备连接和自动挂机线程，导入模块不会进行授权绑定或连接真实设备。
 
 ## 验证
